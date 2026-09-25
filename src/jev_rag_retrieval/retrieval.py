@@ -66,6 +66,65 @@ def split_passages(record: dict[str, Any], max_chars: int = 1400, overlap: int =
     return chunks
 
 
+def redact_for_remote(value: str) -> str:
+    """Remove common credentials from the short text sent to Jev.
+
+    This is a backstop, not a guarantee that arbitrary secrets are detectable.
+    Callers should still exclude sensitive records when possible.
+    """
+    key = os.environ.get("TYPESAFE_API_KEY")
+    if key:
+        value = value.replace(key, "[REDACTED_API_KEY]")
+    patterns = (
+        r"\bapikey_[A-Za-z0-9_]{20,}\b",
+        r"\b(?:sk|ghp|gho|ghu|ghs|github_pat)_[A-Za-z0-9_\-]{20,}\b",
+        r"\bBearer\s+[A-Za-z0-9._~+/=-]{20,}",
+        r"\b(?i:api[_-]?key|access[_-]?token|secret[_-]?key)\b\s*[:=]\s*['\"]?[^\s,'\"}]{12,}",
+    )
+    for pattern in patterns:
+        value = re.sub(pattern, "[REDACTED_CREDENTIAL]", value)
+    return value
+
+
+def from_sivtr_workset(data: dict[str, Any]) -> list[dict[str, Any]]:
+    """Convert sivtr --json search output into one ranked item per WorkRecord."""
+    if not isinstance(data.get("records"), list):
+        raise ValueError("sivtr WorkSet needs a records array")
+    converted = []
+    for record in data["records"]:
+        if not isinstance(record, dict):
+            continue
+        session = record.get("session") or {}
+        workref = record.get("work_ref")
+        session_id = session.get("canonical_id") or session.get("id")
+        if not isinstance(workref, str) or not isinstance(session_id, str):
+            continue
+        messages = []
+        for part in record.get("parts") or []:
+            if not isinstance(part, dict) or part.get("kind") != "message":
+                continue
+            role = part.get("role")
+            if role not in ("user", "assistant"):
+                continue
+            content = part.get("content") or {}
+            value = content.get("Text", {}) if isinstance(content, dict) else {}
+            value = value.get("content", "") if isinstance(value, dict) else ""
+            if isinstance(value, str) and value.strip():
+                messages.append(f"{role}: {redact_for_remote(value[:4000])}")
+        if not messages:
+            continue
+        time = record.get("time") or {}
+        converted.append({
+            "session_id": session_id,
+            "workspace": str(record.get("cwd") or data.get("cwd") or ""),
+            "workref": workref,
+            "text": "\n".join(messages),
+            "title": redact_for_remote(str(record.get("title") or "")),
+            "timestamp": str(time.get("started_at") or "") if isinstance(time, dict) else "",
+        })
+    return converted
+
+
 def _jev_score(query: str, candidate: str, stage: str) -> float:
     from typesafe_sdk import Noul, NoulCriteria, TypeSafeClient
 
@@ -79,7 +138,7 @@ def _jev_score(query: str, candidate: str, stage: str) -> float:
     )
     with TypeSafeClient(timeout=45.0) as client:
         response = client.system_one(
-            state={"user_request": query[:1500], "candidate": candidate[:2500]},
+            state={"user_request": redact_for_remote(query)[:1500], "candidate": redact_for_remote(candidate)[:2500]},
             questions={"relevant": question},
         )
     answer = getattr(response, "answers", None) or getattr(response, "nouls", None)
